@@ -1,0 +1,4 @@
+flask>=2.2
+pymupdf>=1.23
+# 仅自测脚本 selftest.py 需要
+pillow>=9.0

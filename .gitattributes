@@ -1,0 +1,8 @@
+# Windows 批处理必须保持 CRLF 换行：LF 会让 cmd.exe 解析错位，
+# 表现为双击后窗口一闪就关（脚本尾部的 pause 不执行）。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制资源不做任何换行转换
+*.pdf binary
+*.png binary

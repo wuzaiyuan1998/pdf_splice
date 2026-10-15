@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PDF 单面拼接器</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand"><span class="logo">⇄</span><span>PDF 单面拼接器</span></div>
+  <div class="hint">打印机单面扫描 → 两叠 PDF → 交错拼成一份完整 PDF</div>
+  <div class="stats" id="stats">等待载入 PDF…</div>
+  <div class="top-actions">
+    <div class="seg" id="segView" title="网格：一屏看多页；竖向预览：整页顺次往下滚">
+      <span class="seg-label">样式</span>
+      <button data-view="grid" class="on">网格</button>
+      <button data-view="preview">竖向预览</button>
+    </div>
+    <button class="btn ghost" id="btnSwap" title="交换 A / B 两叠">⇄ 交换 A / B</button>
+    <button class="btn ghost" id="btnTheme" title="切换浅色 / 深色">🌗</button>
+  </div>
+</header>
+
+<main class="cols">
+
+  <!-- ─────────────── 第一列：PDF_A ─────────────── -->
+  <section class="col" data-slot="A">
+    <header class="col-head">
+      <span class="slot-chip a">A</span>
+      <div class="col-title">
+        <h2>PDF_A</h2>
+        <div class="fname">未载入</div>
+      </div>
+      <span class="count"></span>
+    </header>
+    <div class="col-tools">
+      <button class="btn" data-act="pick" data-slot="A">载入 PDF</button>
+      <button class="btn ghost" data-act="rot-all" data-slot="A" data-delta="-90" title="整叠逆时针 90°">↺ 全部</button>
+      <button class="btn ghost" data-act="rot-all" data-slot="A" data-delta="90" title="整叠顺时针 90°">↻ 全部</button>
+      <button class="btn ghost" data-act="add-all" data-slot="A" title="这一叠整叠追加到成品末尾">整叠加入成品</button>
+      <button class="btn ghost danger" data-act="clear" data-slot="A" title="清空这一叠">清空</button>
+    </div>
+    <div class="col-note">第 1 叠 · 先扫的那一面（一般是 1,3,5…）</div>
+    <div class="pages grid" id="pagesA" data-slot="A"></div>
+  </section>
+
+  <!-- ─────────────── 第二列：PDF_B ─────────────── -->
+  <section class="col" data-slot="B">
+    <header class="col-head">
+      <span class="slot-chip b">B</span>
+      <div class="col-title">
+        <h2>PDF_B</h2>
+        <div class="fname">未载入</div>
+      </div>
+      <span class="count"></span>
+    </header>
+    <div class="col-tools">
+      <button class="btn" data-act="pick" data-slot="B">载入 PDF</button>
+      <button class="btn ghost" data-act="rot-all" data-slot="B" data-delta="-90" title="整叠逆时针 90°">↺ 全部</button>
+      <button class="btn ghost" data-act="rot-all" data-slot="B" data-delta="90" title="整叠顺时针 90°">↻ 全部</button>
+      <button class="btn ghost" data-act="add-all" data-slot="B" title="这一叠整叠追加到成品末尾">整叠加入成品</button>
+      <button class="btn ghost danger" data-act="clear" data-slot="B" title="清空这一叠">清空</button>
+    </div>
+    <div class="col-note">第 2 叠 · 翻面后扫的那一面（一般是 2,4,6…）</div>
+    <div class="pages grid" id="pagesB" data-slot="B"></div>
+  </section>
+
+  <!-- ─────────────── 第三列：PDF_out ─────────────── -->
+  <section class="col out" data-slot="OUT">
+    <header class="col-head">
+      <span class="slot-chip out">OUT</span>
+      <div class="col-title">
+        <h2>PDF_out</h2>
+        <div class="fname" id="outInfo">成品（空）</div>
+      </div>
+      <span class="count" id="outCount"></span>
+    </header>
+
+    <div class="col-tools wrap">
+      <div class="seg" id="segMode">
+        <button data-mode="interleave" class="on" title="A、B 逐页交错">自动交错</button>
+        <button data-mode="concat" title="先全部 A，再全部 B">顺序拼接</button>
+      </div>
+      <div class="seg" id="segFirst">
+        <span class="seg-label">先</span>
+        <button data-first="A" class="on">A</button>
+        <button data-first="B">B</button>
+      </div>
+      <label class="check" title="翻面后那一叠的堆叠顺序常常是反的，勾上即倒序取页">
+        <input type="checkbox" id="chkReverse"> 后一叠倒序
+      </label>
+      <button class="btn primary" id="btnBuild">生成成品</button>
+      <button class="btn ghost" id="btnAutosort" title="读页脚 / 页眉的 n/N 页码，按真实页码自动排序">按页码排序</button>
+    </div>
+
+    <div class="col-tools wrap">
+      <input id="outName" class="input" placeholder="导出文件名（可留空）">
+      <button class="btn primary" id="btnExport">导出 PDF</button>
+      <button class="btn ghost" id="btnOpenDir">输出目录</button>
+      <button class="btn ghost danger" id="btnClearOut" title="清空成品">清空</button>
+    </div>
+
+    <div class="col-note">把 A / B 的页面拖到这里手动插页 · 成品内拖动可重排 · 点 × 删除</div>
+    <div class="pages list" id="pagesOut" data-slot="OUT"></div>
+  </section>
+
+</main>
+
+<input type="file" id="fileInput" accept="application/pdf,.pdf" multiple hidden>
+
+<div id="lightbox" class="lightbox hidden">
+  <div class="lb-bar">
+    <span class="lb-title" id="lbTitle"></span>
+    <div class="lb-tools">
+      <button class="btn ghost" data-lb="rot-l">↺ 左转</button>
+      <button class="btn ghost" data-lb="rot-r">↻ 右转</button>
+      <button class="btn ghost" data-lb="prev">上一页</button>
+      <button class="btn ghost" data-lb="next">下一页</button>
+      <button class="btn" data-lb="close">关闭 (Esc)</button>
+    </div>
+  </div>
+  <div class="lb-stage"><img id="lbImg" alt=""></div>
+</div>
+
+<div id="toasts" class="toasts"></div>
+
+<script src="/static/app.js" defer></script>
+</body>
+</html>

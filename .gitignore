@@ -1,0 +1,13 @@
+uploads/
+output/
+.probe/
+__pycache__/
+*.pyc
+
+# 助手内部备忘（想随仓库同步就删掉这一行）
+.workbuddy/
+
+# 样例扫描件：真实材料，不入库。
+# 需要跑 selftest.py 时，把同名文件放回项目根目录即可
+奇数页.pdf
+偶数页.pdf
