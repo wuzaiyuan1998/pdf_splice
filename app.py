@@ -176,6 +176,17 @@ def api_rotate():
     return jsonify(session.snapshot())
 
 
+@app.post("/api/reverse_slot")
+def api_reverse_slot():
+    """{slot:'A'|'B'}  把这一叠的页序整个倒过来（再调一次即还原）。成品内容不变。"""
+    data = request.get_json(silent=True) or {}
+    try:
+        session.reverse(data.get("slot"))
+    except Exception as exc:
+        return _json_error(str(exc))
+    return jsonify(session.snapshot())
+
+
 @app.post("/api/build")
 def api_build():
     """{mode:'interleave'|'concat', first:'A'|'B', reverse_second:bool}"""
@@ -257,6 +268,38 @@ def api_out_clear():
     return jsonify(session.snapshot())
 
 
+@app.post("/api/out/blank")
+def api_out_blank():
+    """扫描成品里的空白页，**只读、不改状态**。
+
+    {preset:'strict'|'normal'|'loose'}
+    返回体就是状态快照，另加一个 blank 字段装扫描详情：
+      blank.pages  —— 命中的空白页（默认列表）
+      blank.rows   —— 成品全部页，每页都带墨迹指标（界面「显示全部页」用）
+    删除不由这个接口负责：界面把用户勾选的位置提交给 /api/out/remove。
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        scan = session.scan_blank(data.get("preset"))
+    except Exception as exc:
+        return _json_error(str(exc))
+    snap = session.snapshot()
+    snap["blank"] = scan
+    return jsonify(snap)
+
+
+@app.post("/api/out/undo")
+def api_out_undo():
+    """撤销最近一次删除（含「删空白页」和手动删除）。"""
+    try:
+        restored = session.undo_remove()
+    except Exception as exc:
+        return _json_error(str(exc))
+    snap = session.snapshot()
+    snap["restored"] = restored
+    return jsonify(snap)
+
+
 @app.post("/api/swap")
 def api_swap():
     session.swap_slots()
@@ -265,7 +308,11 @@ def api_swap():
 
 @app.get("/api/thumb/<slot>/<int:index>")
 def api_thumb(slot: str, index: int):
-    """缩略图。r=旋转角度（默认取该页当前角度），size=长边像素。"""
+    """缩略图。index 是叠内位置；r=旋转角度（默认取该页当前角度），size=长边像素。
+
+    前端还会带一个 p=物理页码，那只是让浏览器缓存能区分「同一位置、不同物理页」
+    （源叠倒序后会出现这种情况），服务端不读它，一律按叠序自己算。
+    """
     slot = slot.upper()
     raw_rot = request.args.get("r")
     rot = None if raw_rot in (None, "") else engine.norm_rot(raw_rot)
@@ -278,7 +325,9 @@ def api_thumb(slot: str, index: int):
     except Exception as exc:
         return _json_error(str(exc), 404)
     resp = app.response_class(png, mimetype="image/png")
-    resp.headers["Cache-Control"] = "public, max-age=86400"     # URL 里带了旋转角，可安全长缓存
+    # URL 已完整决定内容（位置 + 物理页码 + 旋转 + 尺寸），可以安全长缓存。
+    # 注意：改动 thumbUrl 的参数时必须同步更新这里的前提，否则会命中过期图片。
+    resp.headers["Cache-Control"] = "public, max-age=86400"
     return resp
 
 

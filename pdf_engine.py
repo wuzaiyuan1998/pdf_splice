@@ -9,8 +9,10 @@ pdf_engine.py —— PDF 单面扫描交错拼接核心引擎
 能力：
     * 载入 A / B 两叠 PDF（一个槽位也支持上传多个文件，按顺序合并成一叠）
     * 每页独立旋转（90° 步进），整叠旋转
+    * 源叠整体倒序
     * 成品页序：自动交错 / 顺序拼接 / 按页脚页码自动排序
     * 拖动插入、拖动重排、删除、成品页单独旋转
+    * 识别成品里的空白页（给出每页墨迹指标，供人工勾选后手动删除，可撤销）
     * 缩略图渲染（带 LRU 缓存）
     * 导出成品 PDF
 
@@ -18,6 +20,7 @@ pdf_engine.py —— PDF 单面扫描交错拼接核心引擎
     python pdf_engine.py --a 奇数页.pdf --b 偶数页.pdf --out 成品.pdf
     python pdf_engine.py --a A.pdf --b B.pdf --out 成品.pdf --reverse-second
     python pdf_engine.py --a A.pdf --b B.pdf --out 成品.pdf --concat
+    python pdf_engine.py --a A.pdf --b B.pdf --out 成品.pdf --drop-blank normal
 """
 
 from __future__ import annotations
@@ -26,7 +29,7 @@ import os
 import re
 import threading
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -45,6 +48,40 @@ ROT_CHOICES = (0, 90, 180, 270)
 # 页脚 / 页眉里常见的「3/6」「第 3 页 / 共 6 页」形式
 NUM_SLASH_RE = re.compile(r"(\d{1,4})\s*[/／]\s*(\d{1,4})")
 NUM_CN_RE = re.compile(r"第\s*(\d{1,4})\s*页")
+
+# ---- 空白页判定 --------------------------------------------------------------
+#
+# 扫描件的空白页不是纯白：纸面有灰度、有 JPEG 噪点，边缘还常有黑边和装订阴影。
+# 所以判定用两个指标叠加，任一超标都认为「有内容」：
+#
+#   1. dark_ratio —— 比纸张底色暗 70 级以上的像素占比（真正的墨迹）。
+#      纸张底色取 97 分位，这样曝光偏灰的扫描件也能自适应。
+#   2. block_drop —— 把页面切成 24×24 块后，最暗那一块的均值比底色低多少。
+#      这一条用来区分「有字」和「均匀噪点」：整页只有一枚小页码时 dark_ratio 很低
+#      （0.013%），但墨迹集中在一小块里，block_drop 会明显抬头（实测 6.6~13.7），
+#      而撒满整页的淡淡噪点分摊到每块几乎不影响均值（实测 0.4）。
+#
+# 实测（A4 页渲染到长边 700px）：
+#   正文页        dark 0.32%~3.35% / drop 25.6~42.1
+#   只有一枚页码   dark 0.013%      / drop 6.6
+#   空白·噪点·偏灰 dark 0           / drop 0~0.4
+# 所以「噪点」与「有内容」在 drop 上有 16 倍以上的间距，阈值取在中间地带最稳。
+
+BLANK_ANALYZE_SIDE = 700       # 分析时把长边渲染成多少像素（越大越准、越慢）
+BLANK_GRID = 24                # 分块数（block_drop 用）
+BLANK_EDGE_CROP = 0.02         # 四周裁掉的比例（避开扫描黑边 / 装订阴影）
+BLANK_BG_QUANTILE = 0.97       # 纸张底色取这个分位，避免被边缘阴影拉低
+BLANK_DARK_DELTA = 70          # 「深色」的定义：比底色暗这么多级
+
+BLANK_PRESETS: Dict[str, dict] = {
+    "strict": {"label": "严格", "dark": 0.0001, "drop": 1.5,
+               "note": "只删几乎全白的页；扫描噪点多一点就可能漏掉"},
+    "normal": {"label": "标准", "dark": 0.0003, "drop": 5.0,
+               "note": "删空白页和扫描噪点页；有墨迹、只有页码的页会保留"},
+    "loose": {"label": "宽松", "dark": 0.0010, "drop": 22.0,
+               "note": "内容极少的页也删，可能误删只有页码的页"},
+}
+BLANK_DEFAULT_PRESET = "normal"
 
 
 # ---------------------------------------------------------------- 小工具
@@ -160,6 +197,104 @@ def detect_page_numbers(path: str, page_count: int) -> List[Optional[int]]:
     return result
 
 
+# ---------------------------------------------------------------- 空白页判定
+
+
+def _dark_table(cut: int) -> bytes:
+    """造一张 256 字节的翻译表：小于 cut 的映射成 1，其余为 0。
+
+    配合 bytes.translate().count(1) 用 C 速度数深色像素，比逐字节判断快一个量级。
+    """
+    return bytes(1 if v < cut else 0 for v in range(256))
+
+
+def page_ink_stats(path: str, file_index: int, side: int = BLANK_ANALYZE_SIDE) -> dict:
+    """
+    分析 PDF 里某一页（**文件页码**）的墨迹情况，返回判定空白页所需的指标。
+
+    只依赖 PyMuPDF 和标准库，不引入 numpy 之类的新依赖。
+    """
+    doc = open_pdf(path)
+    try:
+        if not 0 <= file_index < doc.page_count:
+            raise IndexError("页码越界：%s > %s" % (file_index, doc.page_count))
+        page = doc[file_index]
+        rect = page.rect
+        long_side = max(rect.width, rect.height) or 1.0
+        zoom = min(side / long_side, 4.0)
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom),
+                              colorspace=pymupdf.csGRAY, alpha=False)
+    finally:
+        doc.close()
+
+    w, h, raw = pix.width, pix.height, pix.samples
+    mx, my = int(w * BLANK_EDGE_CROP), int(h * BLANK_EDGE_CROP)
+    bw, bh = w - 2 * mx, h - 2 * my
+    if bw < 16 or bh < 16:                       # 页面太小就不裁边了
+        mx = my = 0
+        bw, bh = w, h
+    body = b"".join(raw[(my + i) * w + mx: (my + i) * w + mx + bw] for i in range(bh))
+    total = bw * bh
+
+    # 纸张底色：抽样取高分位（抽样是为了快，分位数不需要逐像素精确）
+    step = max(1, total // 150000)
+    sample = body[::step] if step > 1 else body
+    freq = Counter(sample)
+    target = len(sample) * BLANK_BG_QUANTILE
+    cum = 0
+    bg = 255
+    for value in range(256):
+        cum += freq.get(value, 0)
+        if cum >= target:
+            bg = value
+            break
+
+    cut = max(0, bg - BLANK_DARK_DELTA)
+    dark = body.translate(_dark_table(cut)).count(1)
+
+    # 最暗块：分块求均值，取最暗的一块
+    bx = max(1, bw // BLANK_GRID)
+    by = max(1, bh // BLANK_GRID)
+    cols = max(1, bw // bx)
+    rows = max(1, bh // by)
+    darkest = 255.0
+    for r in range(rows):
+        base = r * by * bw
+        for c in range(cols):
+            start = c * bx
+            chunk = b"".join(body[base + k * bw + start: base + k * bw + start + bx]
+                             for k in range(by))
+            mean = sum(chunk) / len(chunk)
+            if mean < darkest:
+                darkest = mean
+
+    return {
+        "width": bw,
+        "height": bh,
+        "total": total,
+        "bg": bg,                                  # 纸张底色
+        "cut": cut,                                # 深色阈值
+        "dark": dark,                              # 深色像素数
+        "dark_ratio": dark / total,                # 深色像素占比
+        "darkest_block": round(darkest, 1),        # 最暗块的均值
+        "block_drop": round(bg - darkest, 1),      # 最暗块比底色低多少
+    }
+
+
+def blank_preset(name: Optional[str] = None) -> dict:
+    """取空白页判定的灵敏度配置，非法值抛 ValueError。"""
+    key = str(name or BLANK_DEFAULT_PRESET).strip().lower()
+    cfg = BLANK_PRESETS.get(key)
+    if cfg is None:
+        raise ValueError("灵敏度只能是 %s（收到 %r）" % (" / ".join(BLANK_PRESETS), name))
+    return dict(cfg, key=key)
+
+
+def is_blank(stats: dict, cfg: dict) -> bool:
+    """两个指标都低于阈值才算空白页。"""
+    return stats["dark_ratio"] <= cfg["dark"] and stats["block_drop"] <= cfg["drop"]
+
+
 # ---------------------------------------------------------------- 数据模型
 
 
@@ -186,7 +321,15 @@ class Item:
 
 @dataclass
 class DocState:
-    """一叠源 PDF。"""
+    """
+    一叠源 PDF。
+
+    `order` 记录「叠里的第 i 页」对应 PDF 文件里的第几页；`rots` 也按**叠内位置**索引。
+    两者初始都是恒等映射，点「倒序」后同时反转。
+
+    这样成品里的 `index` 始终表示「叠内第几页」而不是文件页码，倒序叠序时只要把成品的
+    index 一起镜像，成品指向的物理页就不会变 —— 否则倒序会静默改掉成品的内容。
+    """
 
     slot: str
     name: str = ""
@@ -194,10 +337,31 @@ class DocState:
     size: int = 0
     page_count: int = 0
     rots: List[int] = field(default_factory=list)
+    order: List[int] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.order and self.page_count:
+            self.order = list(range(self.page_count))
 
     @property
     def loaded(self) -> bool:
         return bool(self.path) and self.page_count > 0
+
+    @property
+    def reversed(self) -> bool:
+        """这一叠当前是否处于倒序状态。"""
+        return self.page_count > 0 and self.order != list(range(self.page_count))
+
+    def file_index(self, pos: int) -> int:
+        """叠内第 pos 页 → PDF 文件里的页码。"""
+        return self.order[pos]
+
+    def pos_of_file(self) -> List[int]:
+        """file_index 的反向映射：PDF 文件页码 → 叠内位置。"""
+        back = [0] * self.page_count
+        for pos, file_index in enumerate(self.order):
+            back[file_index] = pos
+        return back
 
     def as_dict(self) -> dict:
         pages = [{"index": i, "label": "%s%d" % (self.slot, i + 1)} for i in range(self.page_count)]
@@ -208,6 +372,8 @@ class DocState:
             "page_count": self.page_count,
             "size": self.size,
             "rots": list(self.rots),
+            "order": list(self.order),
+            "reversed": self.reversed,
             "pages": pages,
         }
 
@@ -230,11 +396,17 @@ class Session:
         self.reverse_second = False     # 后一叠是否倒序取页
         self.rev = 0                    # 状态版本号，前端用来判断是否需要刷新
         self._cache: "OrderedDict[tuple, bytes]" = OrderedDict()
+        self._ink_cache: "OrderedDict[tuple, dict]" = OrderedDict()   # 空白页指标缓存
+        self._undo: Optional[dict] = None                             # 最近一次删除的撤销凭据
 
     # -------------------------------------------------- 内部
 
     def _touch(self) -> None:
         self.rev += 1
+
+    def _drop_undo(self) -> None:
+        """成品结构发生变化后，之前那次删除就不能原样恢复了。"""
+        self._undo = None
 
     def _doc(self, slot: str) -> DocState:
         slot = str(slot or "").upper()
@@ -260,6 +432,43 @@ class Session:
         while len(self._cache) > THUMB_CACHE_MAX:
             self._cache.popitem(last=False)
 
+    def _ink_stats(self, path: str, file_index: int) -> dict:
+        """带缓存的墨迹分析：改灵敏度重扫时不必重新渲染。"""
+        key = (path, file_index, BLANK_ANALYZE_SIDE)
+        hit = self._ink_cache.get(key)
+        if hit is not None:
+            self._ink_cache.move_to_end(key)
+            return hit
+        stats = page_ink_stats(path, file_index)
+        self._ink_cache[key] = stats
+        self._ink_cache.move_to_end(key)
+        while len(self._ink_cache) > THUMB_CACHE_MAX:
+            self._ink_cache.popitem(last=False)
+        return stats
+
+    def _capture_undo(self, positions: Sequence[int], label: str) -> List[Tuple[int, Item]]:
+        """记下这次要删的页（位置 + 页副本），供 undo_remove 原样插回。"""
+        entries: List[Tuple[int, Item]] = []
+        for p in sorted({int(p) for p in positions}):
+            if 0 <= p < len(self.out):
+                it = self.out[p]
+                entries.append((p, Item(it.slot, it.index, it.rot)))
+        if entries:
+            self._undo = {"label": label, "entries": entries}
+        return entries
+
+    def _pop_positions(self, positions: Sequence[int]) -> int:
+        """从成品里删掉这些位置（调用方负责先 _capture_undo）。"""
+        removed = 0
+        for p in sorted({int(p) for p in positions}, reverse=True):
+            if 0 <= p < len(self.out):
+                self.out.pop(p)
+                removed += 1
+        if removed:
+            self.mode = "manual"
+            self._touch()
+        return removed
+
     # -------------------------------------------------- 查询
 
     def snapshot(self) -> dict:
@@ -273,6 +482,7 @@ class Session:
                 "mode": self.mode,
                 "first": self.first,
                 "reverse_second": self.reverse_second,
+                "undo": self.undo_info(),
             }
 
     def thumb(self, slot: str, index: int, rot: Optional[int] = None, size: int = DEFAULT_THUMB_SIDE) -> bytes:
@@ -281,12 +491,15 @@ class Session:
             index = self._check_index(doc, index)
             rot = norm_rot(doc.rots[index] if rot is None else rot)
             size = max(MIN_THUMB_SIDE, min(int(size), MAX_THUMB_SIDE))
-            key = (doc.path, index, rot, size)
+            # index 是叠内位置，先翻译成文件页码；缓存键用文件页码，
+            # 这样倒序后同一位置自动渲染成正确的那张图，不会命中旧缓存
+            file_index = doc.file_index(index)
+            key = (doc.path, file_index, rot, size)
             hit = self._cache.get(key)
             if hit is not None:
                 self._cache.move_to_end(key)
                 return hit
-            data = render_page_png(doc.path, index, rot, size)
+            data = render_page_png(doc.path, file_index, rot, size)
             self._cache_put(key, data)
             return data
 
@@ -310,6 +523,8 @@ class Session:
             self.docs[slot] = doc
             self.out = [it for it in self.out if it.slot != slot]
             self._cache.clear()
+            self._ink_cache.clear()
+            self._drop_undo()
             self._touch()
             return doc
 
@@ -321,6 +536,8 @@ class Session:
             self.docs[slot] = DocState(slot)
             self.out = [it for it in self.out if it.slot != slot]
             self._cache.clear()
+            self._ink_cache.clear()
+            self._drop_undo()
             self._touch()
 
     # -------------------------------------------------- 旋转
@@ -343,6 +560,24 @@ class Session:
                 for it in self.out:
                     if it.slot == doc.slot and it.index == i and norm_rot(it.rot) == old:
                         it.rot = new
+            self._touch()
+
+    def reverse(self, slot: str) -> None:
+        """
+        把这一叠的页序整个倒过来（再点一次即还原）。
+
+        成品**保持原样**：成品页记录的是「叠内第几页」，这里把成品里来自该叠的 index
+        一起做镜像，让每一页仍然指向原来那个物理页。只在叠序上做文章，不动成品内容 ——
+        想按新顺序重排成品，重新 build() 即可。
+        """
+        with self.lock:
+            doc = self._doc(slot)
+            n = doc.page_count
+            doc.order.reverse()
+            doc.rots.reverse()
+            for it in self.out:
+                if it.slot == doc.slot:
+                    it.index = n - 1 - it.index
             self._touch()
 
     # -------------------------------------------------- 成品生成
@@ -387,6 +622,7 @@ class Session:
                 self.mode = "interleave"
 
             self.out = items
+            self._drop_undo()
             self._touch()
             return list(self.out)
 
@@ -401,9 +637,12 @@ class Session:
                 doc = self.docs[slot]
                 if not doc.loaded:
                     continue
+                # detect_page_numbers 按「文件页码」返回，这里换算成叠内位置
                 nums = detect_page_numbers(doc.path, doc.page_count)
-                for i, num in enumerate(nums):
-                    pool.append((slot, i, num, doc.rots[i]))
+                back = doc.pos_of_file()
+                for file_index, num in enumerate(nums):
+                    pos = back[file_index]
+                    pool.append((slot, pos, num, doc.rots[pos]))
 
             total_pages = len(pool)
             if total_pages < 2:
@@ -426,6 +665,7 @@ class Session:
 
             self.out = items
             self.mode = "manual"
+            self._drop_undo()
             self._touch()
             return True, "按页码排序完成：识别 %d/%d 页，结果 %d 页" % (len(known), total_pages, len(items))
 
@@ -438,6 +678,7 @@ class Session:
             pos = len(self.out) if at is None else max(0, min(int(at), len(self.out)))
             self.out.insert(pos, Item(doc.slot, index, doc.rots[index]))
             self.mode = "manual"
+            self._drop_undo()
             self._touch()
             return pos
 
@@ -449,6 +690,7 @@ class Session:
             for offset, i in enumerate(range(doc.page_count)):
                 self.out.insert(pos + offset, Item(doc.slot, i, doc.rots[i]))
             self.mode = "manual"
+            self._drop_undo()
             self._touch()
             return pos
 
@@ -466,20 +708,17 @@ class Session:
                 to -= 1
             self.out.insert(to, item)
             self.mode = "manual"
+            self._drop_undo()
             self._touch()
 
     def remove_out(self, positions: Sequence[int]) -> int:
+        """删除成品里的若干页（可撤销一次）。界面勾选空白页后的删除也走这里。"""
         with self.lock:
-            idx = sorted({int(p) for p in positions}, reverse=True)
-            removed = 0
-            for p in idx:
-                if 0 <= p < len(self.out):
-                    self.out.pop(p)
-                    removed += 1
-            if removed:
-                self.mode = "manual"
-                self._touch()
-            return removed
+            entries = self._capture_undo(positions, "删除")
+            if not entries:
+                return 0
+            self._undo["label"] = "删除 %d 页" % len(entries)
+            return self._pop_positions([p for p, _ in entries])
 
     def rotate_out(self, positions: Sequence[int], delta: int) -> None:
         delta = norm_rot(delta)
@@ -495,7 +734,99 @@ class Session:
     def clear_out(self) -> None:
         with self.lock:
             self.out = []
+            self._drop_undo()
             self._touch()
+
+    # -------------------------------------------------- 空白页
+
+    def scan_blank(self, preset: Optional[str] = None) -> dict:
+        """
+        扫描成品每一页的墨迹指标、标出哪些是空白页，**不修改任何状态**
+        （界面据此让用户勾选，再由用户手动删）。
+
+        返回里两组数据都给：
+            pages —— 只有命中的页（界面默认列表、命令行提示用）
+            rows  —— 成品全部页，每项都带墨迹指标（界面「显示全部页」时用）
+        同一页被成品引用多次时只分析一次（靠 _ink_stats 缓存）。
+        """
+        cfg = blank_preset(preset)
+        with self.lock:
+            if not self.out:
+                raise ValueError("成品还是空的，先点「生成成品」或从 A/B 拖页进来")
+            seen: Dict[tuple, dict] = {}
+            rows: List[dict] = []
+            for pos, it in enumerate(self.out):
+                doc = self.docs.get(it.slot)
+                if doc is None or not doc.loaded:
+                    continue
+                file_index = doc.file_index(it.index)          # 叠内位置 → 文件页码
+                key = (doc.path, file_index)
+                stats = seen.get(key)
+                if stats is None:
+                    stats = self._ink_stats(doc.path, file_index)
+                    seen[key] = stats
+                rows.append({
+                    "pos": pos,
+                    "slot": it.slot,
+                    "index": it.index,
+                    "label": "%s%d" % (it.slot, it.index + 1),
+                    "blank": is_blank(stats, cfg),
+                    "dark_ratio": round(stats["dark_ratio"], 6),
+                    "block_drop": stats["block_drop"],
+                    "bg": stats["bg"],
+                })
+            blanks = [r for r in rows if r["blank"]]
+            return {
+                "preset": cfg["key"],
+                "label": cfg["label"],
+                "note": cfg["note"],
+                "scanned": len(rows),
+                "count": len(blanks),
+                "removed": 0,
+                "positions": [r["pos"] for r in blanks],
+                "pages": blanks,
+                "rows": rows,
+            }
+
+    def remove_blank(self, preset: Optional[str] = None) -> dict:
+        """
+        扫描并**直接删掉全部命中的**空白页，返回扫描详情（含 removed 数量）。可撤销一次。
+
+        这条路径只给命令行 --drop-blank 用（一次跑完、不留交互）。
+        界面是「先勾选、再由用户点删除」，走 scan_blank + remove_out。
+        """
+        with self.lock:
+            scan = self.scan_blank(preset)
+            positions = scan["positions"]
+            if positions:
+                entries = self._capture_undo(positions, "删除空白页")
+                self._undo["label"] = "删除空白页 %d 张" % len(entries)
+                scan["removed"] = self._pop_positions(positions)
+            return scan
+
+    def undo_remove(self) -> int:
+        """撤销最近一次删除，把页面按原位置插回去。"""
+        with self.lock:
+            undo = self._undo
+            if not undo:
+                raise ValueError("没有可撤销的删除（成品结构改动后就无法撤销了）")
+            for pos, item in undo["entries"]:
+                at = max(0, min(int(pos), len(self.out)))
+                self.out.insert(at, Item(item.slot, item.index, item.rot))
+            restored = len(undo["entries"])
+            self._undo = None
+            self.mode = "manual"
+            self._touch()
+            return restored
+
+    def undo_info(self) -> dict:
+        with self.lock:
+            undo = self._undo
+            return {
+                "available": bool(undo),
+                "count": len(undo["entries"]) if undo else 0,
+                "label": undo["label"] if undo else "",
+            }
 
     def swap_slots(self) -> None:
         """交换 A / B 两叠（连成品里的来源标记一起换）。"""
@@ -509,6 +840,7 @@ class Session:
                     it.slot = "B"
                 elif it.slot == "B":
                     it.slot = "A"
+            self._drop_undo()
             self._touch()
 
     # -------------------------------------------------- 导出
@@ -520,6 +852,7 @@ class Session:
                 raise ValueError("成品是空的，先点「生成」或从 A/B 拖页进来")
             items = list(self.out)
             paths = {slot: self.docs[slot].path for slot in ("A", "B")}
+            orders = {slot: list(self.docs[slot].order) for slot in ("A", "B")}
 
         os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
         out = pymupdf.open()
@@ -535,7 +868,8 @@ class Session:
                     handles[it.slot] = doc
                 if not 0 <= it.index < doc.page_count:
                     continue
-                out.insert_pdf(doc, from_page=it.index, to_page=it.index, links=True)
+                file_index = orders[it.slot][it.index]      # 叠内位置 → 文件页码
+                out.insert_pdf(doc, from_page=file_index, to_page=file_index, links=True)
                 rot = norm_rot(it.rot)
                 if rot:
                     out[-1].set_rotation(rot)
@@ -571,11 +905,16 @@ def _main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--b", help="第二叠 PDF（背面）")
     parser.add_argument("--out", required=True, help="输出 PDF 路径")
     parser.add_argument("--reverse-second", action="store_true", help="后一叠倒序取页")
+    parser.add_argument("--reverse-a", action="store_true", help="A 叠页序倒过来")
+    parser.add_argument("--reverse-b", action="store_true", help="B 叠页序倒过来")
     parser.add_argument("--first", default="A", choices=["A", "B"], help="交错时哪一叠在前")
     parser.add_argument("--concat", action="store_true", help="顺序拼接而不是交错")
     parser.add_argument("--rotate-a", type=int, default=0, help="A 叠统一旋转角度")
     parser.add_argument("--rotate-b", type=int, default=0, help="B 叠统一旋转角度")
     parser.add_argument("--autosort", action="store_true", help="按页脚页码自动排序")
+    parser.add_argument("--drop-blank", nargs="?", const=BLANK_DEFAULT_PRESET,
+                        choices=sorted(BLANK_PRESETS),
+                        help="删掉成品里的空白页，可指定灵敏度：" + " / ".join(sorted(BLANK_PRESETS)))
     args = parser.parse_args(argv)
 
     sess = Session()
@@ -586,6 +925,10 @@ def _main(argv: Optional[List[str]] = None) -> int:
         sess.rotate("A", args.rotate_a)
     if args.rotate_b:
         sess.rotate("B", args.rotate_b)
+    if args.reverse_a:
+        sess.reverse("A")
+    if args.reverse_b:
+        sess.reverse("B")
 
     if args.autosort:
         ok, note = sess.autosort()
@@ -595,6 +938,11 @@ def _main(argv: Optional[List[str]] = None) -> int:
     else:
         sess.build(mode="concat" if args.concat else "interleave",
                    first=args.first, reverse_second=args.reverse_second)
+
+    if args.drop_blank:
+        scan = sess.remove_blank(args.drop_blank)
+        print("空白页（%s）：扫 %d 页，删 %d 页，剩 %d 页"
+              % (scan["label"], scan["scanned"], scan["removed"], len(sess.out)))
 
     save_to = os.path.abspath(args.out)
     sess.export_pdf(save_to)

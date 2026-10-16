@@ -28,14 +28,62 @@ PDF_A  |  PDF_B  |  PDF_out
 | PDF 转向 | 每张缩略图右上角 `↺` `↻` | 单页旋转 90°；栏头「↺ 全部 / ↻ 全部」整叠旋转 |
 | 放大预览 | 点击任意缩略图 | 大图查看，`←` `→` 翻页，`R` 右转，`Esc` 关闭 |
 | 奇偶页交错拼接 | 右栏「自动交错」+「先 A / 先 B」 | A、B 逐页交替：A1 B1 A2 B2 … |
-| 后一叠倒序 | 右栏勾选框 | 翻面后那一叠堆叠顺序常常是反的，勾上即倒序取页 |
+| 源叠倒序 | 左 / 中栏「⇅ 倒序」 | 把这一叠的页序整个倒过来（再点一次还原）。翻面那叠顺序反了、想从根上修正时用；已生成的**成品保持原样**，想按新顺序重排要重新点「生成成品」 |
+| 后一叠倒序 | 右栏勾选框 | 翻面后那一叠堆叠顺序常常是反的，勾上即倒序取页。不改动源叠本身，只影响本次合并 |
 | 顺序拼接 | 右栏「顺序拼接」 | 先全部 A，再全部 B（两摞独立文档时用） |
 | 按页码排序 | 右栏「按页码排序」 | 读页脚 / 页眉的 `n/N` 页码，按真实页码自动排序 |
+| 勾选空白页 | 右栏「勾选空白页」 | 扫描出空白页（含扫描噪点页）并**列成可勾选的卡片**，命中页默认全勾；人工确认（逐页取消 / 补勾）后点「删除勾选的 N 页」才真删。删完可「↶ 撤销删除」 |
 | 拖动某一页拼接 | 从 A / B 拖到右栏 | 拖到右栏任意位置即插入该处；成品内拖动可重排 |
 | 删除成品页 | 成品行右侧 `×` | 也可以把成品页拖回 A / B 栏 |
 | 导出文件名 | 右栏输入框 | 留空则自动命名 `拼接_年月日_时分秒.pdf` |
 
 旋转规则：转源页时，成品里**由这一页生成、且没被单独转过**的页会跟着转；已经单独转过的成品页保持不动。
+
+页序规则：界面上的 `A1 / A2 / …` 一律指**这一叠里的第几张**（叠内位置），不是 PDF 文件里的页码。
+点「倒序」时叠内位置与文件页码的对应关系整体翻转，同时把成品里来自这一叠的引用一起做镜像，
+所以成品仍然指向原来那些页面 —— 内容不会因为你调整叠序而被悄悄改掉。
+
+### 空白页是怎么判定的
+
+扫描出来的空白页不是纯白：纸面有灰度、有 JPEG 噪点，边缘还常有黑边和装订阴影。所以判定用两个指标叠加，
+**两个都低**才算空白（引擎里是 `page_ink_stats` + `is_blank`）：
+
+1. `dark_ratio` —— 比纸张底色暗 70 级以上的像素占比（真正的墨迹）。纸张底色按 97 分位取，
+   所以曝光偏灰的扫描件也能自适应。
+2. `block_drop` —— 页面切成 24×24 块后，最暗那一块的均值比底色低多少。用来区分「有字」和「均匀噪点」：
+   整页只有一枚页码时 `dark_ratio` 很低，但墨迹集中在一小块里，`block_drop` 会明显抬头；
+   撒满整页的淡噪点分摊到每块几乎不动均值。
+
+实测（A4 渲染到长边 700px）：
+
+| 页面 | dark_ratio | block_drop |
+| --- | --- | --- |
+| 正文页 | 0.32% ~ 3.35% | 25.6 ~ 42.1 |
+| 只有一枚页码 | 0.013% | 6.6 |
+| 空白 / 噪点 / 偏灰空白 | 0 | 0 ~ 0.4 |
+
+界面给了三档灵敏度（阈值即上表的两个指标）：
+
+| 档位 | dark_ratio ≤ | block_drop ≤ | 效果 |
+| --- | --- | --- | --- |
+| 严格 | 0.01% | 1.5 | 只删几乎全白的页；扫描噪点多一点就可能漏掉 |
+| 标准（默认） | 0.03% | 5.0 | 删空白页和扫描噪点页；有墨迹、只有页码的页保留 |
+| 宽松 | 0.10% | 22.0 | 内容极少的页也删，可能误删只有页码的页 |
+
+判定不可能百分百准，所以点「勾选空白页」**只做扫描、不删任何东西**（服务端这条接口是只读的），
+弹窗把自动命中的页列成卡片并**默认全部勾选**，等你确认：
+
+| 弹窗里能做什么 | 说明 |
+| --- | --- |
+| 逐页勾选 / 取消 | 点卡片任意处即可切换；卡片右上角 `🔍` 放大确认（`Esc` 只关大图） |
+| 全选命中 / 全不选 | 一键回到「自动命中」的状态，或清空（勾选为空时删除按钮禁用） |
+| 显示全部页 | 把成品每一页都列出来（不只命中的），可**手动补勾**自动判定漏掉的页；未命中的卡片用虚线区分 |
+| 灵敏度 | 换档位会重扫，勾选同时重置为新的命中集合 |
+
+只有点「删除勾选的 **N** 页」才真正删除，删的就是当前勾选集合（可能是命中页的子集，也可能多出几张手动补勾的）。
+删除可用「↶ 撤销删除」原样恢复；但之后只要重新「生成成品」/排序 / 插删过页面，撤销凭据就失效（避免插回到错位置）。
+分析结果按「文件 + 物理页码」缓存，所以切换灵敏度、切换「显示全部页」都是秒回。
+命令行 `--drop-blank` 仍是「扫完直接删掉全部命中页」的一步到位行为。
 
 ## 文件结构
 
@@ -44,12 +92,12 @@ pdf_splice/
 ├─ start.bat          双击启动（Windows）
 ├─ app.py             Flask 后端：REST API + 静态文件托管
 ├─ pdf_engine.py      核心引擎：载入 / 旋转 / 页序 / 缩略图 / 导出（可单独命令行使用）
-├─ selftest.py        端到端自测（56 项，不起服务、不占端口）
-├─ requirements.txt   flask + pymupdf
+├─ selftest.py        端到端自测（144 项，不起服务、不占端口）
+├─ requirements.txt   flask + pymupdf（pillow 只有自测脚本需要）
 ├─ static/
 │   ├─ index.html     三列界面骨架
 │   ├─ style.css      浅色 / 深色两套主题 × 网格 / 竖向预览两种样式
-│   └─ app.js         前端逻辑（拖拽、旋转、预览、导出）
+│   └─ app.js         前端逻辑（拖拽、旋转、预览、勾选空白页、导出）
 ├─ docs/              两套样式的界面截图（view-grid.png / view-preview.png）
 ├─ uploads/           载入的 PDF 暂存（替换同一栏时会自动清理旧文件）
 └─ output/            导出的成品
@@ -60,7 +108,10 @@ pdf_splice/
 ```bash
 python pdf_engine.py --a 奇数页.pdf --b 偶数页.pdf --out 成品.pdf
 python pdf_engine.py --a A.pdf --b B.pdf --out 成品.pdf --reverse-second
+python pdf_engine.py --a A.pdf --b B.pdf --out 成品.pdf --reverse-b   # 直接把 B 叠页序倒过来
 python pdf_engine.py --a A.pdf --b B.pdf --out 成品.pdf --autosort
+python pdf_engine.py --a A.pdf --b B.pdf --out 成品.pdf --drop-blank  # 顺手删掉空白页（默认标准档）
+python pdf_engine.py --a A.pdf --b B.pdf --out 成品.pdf --drop-blank loose
 ```
 
 ## 自测
@@ -70,7 +121,20 @@ python selftest.py
 ```
 
 用工作目录里的 `奇数页.pdf`（页脚 1/6、3/6、5/6）和 `偶数页.pdf`（页脚 2/6、4/6、6/6）
-验证交错页序、倒序、旋转、拖动插入 / 重排 / 删除、页码自动排序、导出内容，以及全部 API。
+验证交错页序、源叠倒序、旋转、拖动插入 / 重排 / 删除、页码自动排序、导出内容，以及全部 API。
+空白页相关的用例用脚本临时生成另一套样本（`text/blank/noise/footer` 四种页，写在 `output/` 下），
+不需要额外准备文件；其中专门有一条模拟「人工取消勾选其中一页」，验证只删勾选的那几页。
+
+界面部分（大图预览的翻页坐标系、倒序按钮、勾选空白页弹窗）用真实浏览器回归，见 `.probe/verify_*.mjs`：
+需要 `playwright-core` + 本机 Chrome，先起服务再跑
+
+```bash
+BASE_URL=http://127.0.0.1:8770/ node .probe/verify_lightbox.mjs   # 大图预览 22 项
+BASE_URL=http://127.0.0.1:8770/ bash .probe/reset_state.sh        # 换一组基准状态
+BASE_URL=http://127.0.0.1:8770/ node .probe/verify_reverse.mjs    # 源叠倒序 24 项
+BASE_URL=http://127.0.0.1:8770/ bash .probe/reset_blank_state.sh  # 换成带空白页的样本
+BASE_URL=http://127.0.0.1:8770/ node .probe/verify_blank.mjs      # 勾选空白页 60 项
+```
 
 ## REST API
 
@@ -79,16 +143,19 @@ python selftest.py
 | GET | `/api/state` | 取完整状态快照 |
 | POST | `/api/upload` | 表单 `slot=A/B` + `file`（可多个） |
 | POST | `/api/rotate` | `{slot, delta, index?}`（不传 index 为整叠） |
+| POST | `/api/reverse_slot` | `{slot}` 把这一叠页序整个倒过来（再调一次还原）；成品内容不变 |
 | POST | `/api/build` | `{mode:'interleave'/'concat', first:'A'/'B', reverse_second}` |
 | POST | `/api/autosort` | 按页脚页码排序 |
 | POST | `/api/out/insert` | `{slot, index, at}`；`all:true` 整叠插入 |
 | POST | `/api/out/move` | `{from, to}` |
-| POST | `/api/out/remove` | `{positions:[...]}` |
+| POST | `/api/out/remove` | `{positions:[...]}` 删除这些位置（界面勾选空白页后的删除也走这里）；可撤销一次 |
 | POST | `/api/out/rotate` | `{positions:[...], delta}` |
+| POST | `/api/out/blank` | `{preset:'strict'/'normal'/'loose'}` **只读**扫描空白页，返回体带 `blank` 详情（`pages` 命中页 / `rows` 全部页指标）；不删任何页 |
+| POST | `/api/out/undo` | 撤销最近一次删除（含手动删除），返回体带 `restored` 页数 |
 | POST | `/api/out/clear` | 清空成品 |
 | POST | `/api/clear_slot` | `{slot}` 卸载某一叠 |
 | POST | `/api/swap` | 交换 A / B |
-| GET | `/api/thumb/<slot>/<index>?r=&size=` | 页面缩略图 PNG |
+| GET | `/api/thumb/<slot>/<index>?r=&size=&p=` | 页面缩略图 PNG。`index` 是**叠内位置**；`p` 是物理页码，仅作浏览器缓存键，服务端不读 |
 | POST | `/api/export` | `{name}` 导出成品，返回磁盘路径与下载 URL |
 | GET | `/api/download/<name>?inline=1` | 下载 / 内联预览成品 |
 | POST | `/api/open_output` | 在资源管理器里打开输出目录 |

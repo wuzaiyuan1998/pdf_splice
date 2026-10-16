@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 title PDF Splice Tool
 
-set "PY=C:\Users\wuzaiyuan\.workbuddy\binaries\python\envs\default\Scripts\python.exe"
+set "PY=%USERPROFILE%\.workbuddy\binaries\python\envs\default\Scripts\python.exe"
 if not exist "%PY%" (
     echo [WARN] bundled Python not found - falling back to "python" from PATH
     set "PY=python"

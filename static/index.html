@@ -39,6 +39,7 @@
       <button class="btn" data-act="pick" data-slot="A">载入 PDF</button>
       <button class="btn ghost" data-act="rot-all" data-slot="A" data-delta="-90" title="整叠逆时针 90°">↺ 全部</button>
       <button class="btn ghost" data-act="rot-all" data-slot="A" data-delta="90" title="整叠顺时针 90°">↻ 全部</button>
+      <button class="btn ghost" data-act="reverse" data-slot="A" title="把这一叠的页序整个倒过来（再点一次还原）；成品内容保持原样">⇅ 倒序</button>
       <button class="btn ghost" data-act="add-all" data-slot="A" title="这一叠整叠追加到成品末尾">整叠加入成品</button>
       <button class="btn ghost danger" data-act="clear" data-slot="A" title="清空这一叠">清空</button>
     </div>
@@ -60,6 +61,7 @@
       <button class="btn" data-act="pick" data-slot="B">载入 PDF</button>
       <button class="btn ghost" data-act="rot-all" data-slot="B" data-delta="-90" title="整叠逆时针 90°">↺ 全部</button>
       <button class="btn ghost" data-act="rot-all" data-slot="B" data-delta="90" title="整叠顺时针 90°">↻ 全部</button>
+      <button class="btn ghost" data-act="reverse" data-slot="B" title="把这一叠的页序整个倒过来（再点一次还原）；成品内容保持原样">⇅ 倒序</button>
       <button class="btn ghost" data-act="add-all" data-slot="B" title="这一叠整叠追加到成品末尾">整叠加入成品</button>
       <button class="btn ghost danger" data-act="clear" data-slot="B" title="清空这一叠">清空</button>
     </div>
@@ -93,6 +95,8 @@
       </label>
       <button class="btn primary" id="btnBuild">生成成品</button>
       <button class="btn ghost" id="btnAutosort" title="读页脚 / 页眉的 n/N 页码，按真实页码自动排序">按页码排序</button>
+      <button class="btn ghost" data-act="blank" title="扫描成品里的空白页（扫描噪点页也算），列出来供你勾选确认，点「删除」才真正删；删完可撤销">勾选空白页</button>
+      <button class="btn ghost" data-act="undo" id="btnUndo" title="撤销最近一次删除" disabled>↶ 撤销删除</button>
     </div>
 
     <div class="col-tools wrap">
@@ -102,7 +106,7 @@
       <button class="btn ghost danger" id="btnClearOut" title="清空成品">清空</button>
     </div>
 
-    <div class="col-note">把 A / B 的页面拖到这里手动插页 · 成品内拖动可重排 · 点 × 删除</div>
+    <div class="col-note">把 A / B 的页面拖到这里手动插页 · 成品内拖动可重排 · 点 × 删除 · 「勾选空白页」可挑出空白扫描页批量删掉</div>
     <div class="pages list" id="pagesOut" data-slot="OUT"></div>
   </section>
 
@@ -122,6 +126,37 @@
     </div>
   </div>
   <div class="lb-stage"><img id="lbImg" alt=""></div>
+</div>
+
+<div id="blankModal" class="modal hidden" aria-hidden="true">
+  <div class="modal-card">
+    <header class="modal-head">
+      <div>
+        <h3>勾选空白页</h3>
+        <div class="modal-sub" id="blankSub">正在扫描…</div>
+      </div>
+      <div class="seg" id="segBlank" title="灵敏度越高勾得越多：标准会保留只有页码或少量墨迹的页">
+        <span class="seg-label">灵敏度</span>
+        <button data-preset="strict">严格</button>
+        <button data-preset="normal" class="on">标准</button>
+        <button data-preset="loose">宽松</button>
+      </div>
+      <div class="modal-tools">
+        <button class="btn ghost" data-blank="all" title="把自动判定命中的页全部勾上">全选命中</button>
+        <button class="btn ghost" data-blank="none" title="清空勾选（不会有任何页被删）">全不选</button>
+        <label class="check" title="列出成品的每一页（不止自动命中的），可连没判定成空白页的一起勾选删除">
+          <input type="checkbox" id="chkBlankAll"> 显示全部页
+        </label>
+        <span class="modal-count" id="blankPickInfo">已选 0 页</span>
+      </div>
+    </header>
+    <div class="modal-body" id="blankBody"></div>
+    <footer class="modal-foot">
+      <span class="modal-note" id="blankNote"></span>
+      <button class="btn ghost" data-blank="cancel">取消</button>
+      <button class="btn danger" data-blank="confirm" id="btnBlankGo" disabled>删除勾选的页</button>
+    </footer>
+  </div>
 </div>
 
 <div id="toasts" class="toasts"></div>

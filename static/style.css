@@ -261,6 +261,13 @@ body {
 .btn.primary:hover { filter: brightness(1.08); }
 .btn.danger { color: var(--danger); }
 .btn.danger:hover { border-color: var(--danger); background: rgba(248, 113, 113, 0.12); }
+/* 开关型按钮的激活态（如「倒序」按钮已生效时），与 .seg button.on 保持一致 */
+.btn.on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
 .input {
@@ -583,7 +590,7 @@ body {
 .lightbox {
   position: fixed;
   inset: 0;
-  z-index: 60;
+  z-index: 90;                    /* 要盖在「删空白页」弹窗（70）之上，方便放大确认 */
   background: rgba(6, 9, 14, 0.86);
   display: flex;
   flex-direction: column;
@@ -614,6 +621,188 @@ body {
   background: var(--paper);
   border-radius: 6px;
   box-shadow: 0 18px 50px rgba(0, 0, 0, 0.5);
+}
+
+/* ---------------------------------------------- 弹窗（删空白页预览） */
+
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  background: rgba(6, 9, 14, 0.62);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  backdrop-filter: blur(2px);
+}
+.modal.hidden { display: none; }
+
+.modal-card {
+  width: min(880px, 100%);
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+}
+
+.modal-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel-2);
+}
+.modal-head h3 { margin: 0; font-size: 14px; font-weight: 600; }
+.modal-sub { color: var(--muted); font-size: 11.5px; margin-top: 2px; }
+.modal-head .seg { margin-left: auto; }
+
+/* 勾选栏：第二行铺满，放「全选命中 / 全不选 / 显示全部页 / 已选计数」 */
+.modal-tools {
+  flex: 1 1 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+}
+.modal-count {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.modal-body {
+  flex: 1 1 auto;
+  min-height: 60px;
+  overflow: auto;
+  padding: 12px 14px;
+  scrollbar-width: thin;
+}
+.modal-body::-webkit-scrollbar { width: 10px; }
+.modal-body::-webkit-scrollbar-thumb {
+  background: var(--panel-3);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+.blank-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  gap: 10px;
+}
+.blank-cell {
+  position: relative;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px;
+  cursor: pointer;
+}
+.blank-cell:hover { border-color: var(--accent); }
+/* 勾选状态：整格高亮，和「全选 / 全不选」的批量操作结果一眼对得上 */
+.blank-cell.on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+/* 「显示全部页」时自动判定没命中的页：虚线边框 + 淡一点，和命中页区分开 */
+.blank-cell.miss { border-style: dashed; }
+.blank-cell.miss .ph-thumb img { opacity: 0.72; }
+.blank-cell .cell-pick {
+  position: absolute;
+  top: 7px;
+  left: 7px;
+  z-index: 2;
+  width: 21px;
+  height: 21px;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  background: rgba(10, 14, 20, 0.6);
+  border: 1px solid var(--line);
+  cursor: pointer;
+}
+.blank-cell .cell-pick input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+.blank-cell .cell-zoom {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  z-index: 2;
+  width: 23px;
+  height: 21px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  background: rgba(10, 14, 20, 0.6);
+  border: 1px solid var(--line);
+  color: #fff;
+  font: inherit;
+  font-size: 11px;
+  cursor: zoom-in;
+}
+.blank-cell .cell-zoom:hover { border-color: var(--accent); }
+/* 候选页大多是纯白页：给白纸加描边 + 深一点的衬底，否则看不出页边界 */
+.blank-cell .ph-thumb {
+  min-height: 0;
+  background: var(--panel-3);
+  border: 1px solid var(--line);
+}
+.blank-cell .ph-thumb img {
+  max-height: 132px;
+  background: var(--paper);
+  outline: 1px solid var(--line);
+  outline-offset: -1px;
+}
+.blank-cell .cell-meta {
+  margin-top: 5px;
+  font-size: 10.5px;
+  color: var(--muted);
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
+  word-break: break-all;
+}
+.blank-cell .cell-meta b { color: var(--text-dim); }
+.blank-cell .cell-meta .tag { color: var(--warn); }
+.blank-cell .cell-meta .tag.miss { color: var(--muted); }
+
+.modal-empty {
+  padding: 22px 10px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.9;
+}
+.modal-empty b { color: var(--ok); }
+
+.modal-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--line);
+  background: var(--panel-2);
+}
+.modal-note {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11.5px;
 }
 
 /* ---------------------------------------------- 提示 */

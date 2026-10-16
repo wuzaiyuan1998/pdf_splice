@@ -11,7 +11,7 @@ const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const app = {
   data: null,      // 服务端状态快照
   drag: null,      // 当前拖拽的东西 {type:'src'|'out', ...}
-  zoom: null,      // 放大预览 {slot,index}
+  zoom: null,      // 放大预览 {frame,index}；frame 为 'A' / 'B'（源栏）或 'OUT'（成品栏）
   pickSlot: 'A',   // 文件选择框当前归属
   view: 'grid',    // 布局样式：grid（网格） | preview（竖向预览）
 };
@@ -40,8 +40,18 @@ const post = (url, body) => request(url, {
 
 /* ------------------------------------------------ 小工具 */
 
-const thumbUrl = (slot, index, rot, size = 240) =>
-  `/api/thumb/${slot}/${index}?r=${((rot % 360) + 360) % 360}&size=${size}`;
+/**
+ * 缩略图 URL。除「栏位 + 叠内位置 + 旋转 + 尺寸」外，还要带上该位置对应的**物理页码**。
+ *
+ * 后端给缩略图设了长缓存（max-age=86400），前提是 URL 能完全决定图片内容。倒序只改变
+ * 「叠内位置 → 物理页」的对应关系，位置和旋转都没变，所以必须靠 p= 让 URL 跟着变，
+ * 否则倒序后浏览器会拿着同一个 URL 命中旧图，界面看起来像没反应。
+ */
+const thumbUrl = (slot, index, rot, size = 240) => {
+  const doc = app.data && app.data.docs[slot];
+  const phys = doc && doc.order && doc.order[index] != null ? doc.order[index] : index;
+  return `/api/thumb/${slot}/${index}?r=${((rot % 360) + 360) % 360}&size=${size}&p=${phys}`;
+};
 
 /* 网格样式取小图（一屏多页），竖向预览样式取大图（按栏宽铺满整页） */
 const thumbSizeFor = (kind) => (app.view === 'preview' ? 760 : kind === 'row' ? 120 : 240);
@@ -133,7 +143,19 @@ function renderDoc(slot) {
   col.querySelector('.fname').textContent = doc.loaded
     ? `${doc.name} · ${doc.page_count} 页 · ${fmtSize(doc.size)}`
     : '未载入';
-  col.querySelector('.count').textContent = doc.loaded ? doc.page_count + ' 页' : '';
+  col.querySelector('.count').textContent = doc.loaded
+    ? doc.page_count + ' 页' + (doc.reversed ? ' · 已倒序' : '')
+    : '';
+
+  // 「倒序」按钮反映当前叠序状态：已倒序时高亮，未载入时禁用
+  const revBtn = col.querySelector('button[data-act="reverse"]');
+  if (revBtn) {
+    revBtn.classList.toggle('on', !!doc.reversed);
+    revBtn.disabled = !doc.loaded;
+    revBtn.title = doc.reversed
+      ? '这一叠当前已倒序 · 再点一次恢复原顺序'
+      : '把这一叠的页序整个倒过来；成品内容保持原样';
+  }
 
   box.textContent = '';
   if (!doc.loaded) {
@@ -245,6 +267,17 @@ function syncControls() {
   $$('#segMode button').forEach((b) => b.classList.toggle('on', b.dataset.mode === d.mode));
   $$('#segFirst button').forEach((b) => b.classList.toggle('on', b.dataset.first === d.first));
   $('#chkReverse').checked = !!d.reverse_second;
+
+  // 「撤销删除」按钮跟随服务端的可撤销状态
+  const undoBtn = $('#btnUndo');
+  if (undoBtn) {
+    const u = d.undo || {};
+    undoBtn.disabled = !u.available;
+    undoBtn.textContent = u.available ? `↶ 撤销删除 (${u.count})` : '↶ 撤销删除';
+    undoBtn.title = u.available
+      ? `撤销「${u.label}」，恢复 ${u.count} 页`
+      : '撤销最近一次删除（成品结构改动后无法撤销）';
+  }
   renderStats();
 }
 
@@ -293,6 +326,260 @@ async function uploadFiles(slot, files) {
   toast(`PDF_${slot} 载入完成：${data.docs[slot].page_count} 页`, 'ok');
 }
 
+/* ------------------------------------------------ 勾选空白页 */
+
+const BLANK_LABEL = { strict: '严格', normal: '标准', loose: '宽松' };
+
+let blankPreset = 'normal';        // 弹窗里当前选中的灵敏度
+let blankScan = null;              // 最近一次扫描结果（rows = 成品全部页的墨迹指标）
+let blankPick = new Set();         // 已勾选的成品位置（默认 = 自动命中的那些）
+let blankShowAll = false;          // 是否列出成品的每一页，而不只是自动命中的
+
+/** 打一次 /api/out/blank：只扫描，服务端不改任何状态。 */
+async function blankScanRequest(preset) {
+  const snap = await request('/api/out/blank', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ preset }),
+  });
+  apply(snap);
+  return snap.blank || {};
+}
+
+async function openBlankDialog() {
+  if (!app.data || !app.data.out.length) return toast('成品还是空的，先点「生成成品」', 'warn');
+  blankPreset = localStorage.getItem('pdf_splice_blank_preset') || 'normal';
+  if (!BLANK_LABEL[blankPreset]) blankPreset = 'normal';
+  blankShowAll = false;
+  $('#chkBlankAll').checked = false;
+  $$('#segBlank button').forEach((b) => b.classList.toggle('on', b.dataset.preset === blankPreset));
+  $('#blankModal').classList.remove('hidden');
+  $('#blankModal').setAttribute('aria-hidden', 'false');
+  return refreshBlankScan();
+}
+
+function closeBlankDialog() {
+  $('#blankModal').classList.add('hidden');
+  $('#blankModal').setAttribute('aria-hidden', 'true');
+  blankScan = null;
+  blankPick = new Set();
+}
+
+/**
+ * 重新扫描（打开弹窗、切灵敏度都会走这里）。
+ * 扫描只读，勾选一律重置成「全部自动命中的页」—— 换档位后旧勾选已经没有意义了。
+ */
+async function refreshBlankScan() {
+  blankScan = null;
+  blankPick = new Set();
+  const body = $('#blankBody');
+  body.textContent = '';
+  const wait = document.createElement('div');
+  wait.className = 'modal-empty';
+  wait.textContent = '正在分析成品每一页的墨迹…';
+  body.appendChild(wait);
+  $('#blankSub').textContent = '正在扫描…';
+  $('#blankNote').textContent = '';
+  syncBlankPick();                                   // 计数归零、删除按钮禁用
+  try {
+    blankScan = await blankScanRequest(blankPreset);
+  } catch (err) {
+    toast(err.message || String(err), 'err', 5000);
+    return closeBlankDialog();
+  }
+  blankPick = new Set((blankScan.pages || []).map((p) => p.pos));   // 命中页默认勾上
+  renderBlankDialog();
+}
+
+function renderBlankDialog() {
+  const scan = blankScan || {};
+  $('#blankSub').textContent = `${BLANK_LABEL[scan.preset] || scan.preset || ''}灵敏度 · ` +
+    `扫描 ${scan.scanned || 0} 页 · 自动命中 ${(scan.pages || []).length} 页`;
+  renderBlankGrid();
+  syncBlankPick();
+}
+
+function renderBlankGrid() {
+  const scan = blankScan || {};
+  const rows = scan.rows || [];
+  // 「显示全部页」= 成品每一页；否则只列自动命中的页 —— 外加用户手动勾上的页，
+  // 这样任何被勾中的页都一定看得见（否则关掉开关后会留下「看不见却被选中」的页）。
+  const shown = blankShowAll ? rows : rows.filter((r) => r.blank || blankPick.has(r.pos));
+
+  const body = $('#blankBody');
+  body.textContent = '';
+  if (!shown.length) {
+    const div = document.createElement('div');
+    div.className = 'modal-empty';
+    div.innerHTML = `扫了 <b>${scan.scanned || 0}</b> 页，没自动发现空白页。<br>` +
+      '可以换更宽松的灵敏度，或者勾上「显示全部页」手动挑要删的页。';
+    body.appendChild(div);
+    return;
+  }
+
+  const grid = document.createElement('div');
+  grid.className = 'blank-grid';
+  shown.forEach((p) => grid.appendChild(blankCell(p)));
+  body.appendChild(grid);
+}
+
+function blankCell(page) {
+  const item = (app.data.out || [])[page.pos] || {};
+  const cell = document.createElement('div');
+  cell.className = 'blank-cell' + (page.blank ? '' : ' miss') + (blankPick.has(page.pos) ? ' on' : '');
+  cell.dataset.pos = String(page.pos);
+  // 注意：这里不能叫 data-blank —— 弹窗里 [data-blank] 是「动作按钮」的命名空间
+  // （全选 / 全不选 / 取消 / 确认），卡片再用同名属性会被当成动作按钮吞掉点击
+  cell.dataset.hit = page.blank ? '1' : '0';
+  cell.title = `成品第 ${page.pos + 1} 页 · 点卡片勾选 / 取消，点右上角放大确认`;
+
+  const thumb = document.createElement('div');
+  thumb.className = 'ph-thumb';
+  const img = document.createElement('img');
+  img.src = thumbUrl(page.slot, page.index, item.rot || 0, 240);
+  img.alt = page.label;
+  img.loading = 'lazy';
+  thumb.appendChild(img);
+
+  // 勾选框：真 input，键盘也能操作；点卡片其它地方由上面的监听器代劳
+  const pick = document.createElement('label');
+  pick.className = 'cell-pick';
+  const box = document.createElement('input');
+  box.type = 'checkbox';
+  box.checked = blankPick.has(page.pos);
+  box.setAttribute('aria-label', `勾选成品第 ${page.pos + 1} 页`);
+  pick.appendChild(box);
+
+  const zoom = document.createElement('button');
+  zoom.type = 'button';
+  zoom.className = 'cell-zoom';
+  zoom.dataset.zoom = '1';
+  zoom.title = '放大确认这一页';
+  zoom.textContent = '🔍';
+
+  const meta = document.createElement('div');
+  meta.className = 'cell-meta';
+  meta.innerHTML = `<b>成品第 ${page.pos + 1} 页</b> ` +
+    (page.blank ? '<span class="tag">判为空白</span>' : '<span class="tag miss">未判为空白</span>') +
+    `<br>来自 PDF_${page.slot} 第 ${page.index + 1} 页<br>` +
+    `墨迹 ${(page.dark_ratio * 100).toFixed(3)}%`;
+
+  cell.append(thumb, pick, zoom, meta);
+  return cell;
+}
+
+/** 勾选变化后同步：卡片高亮 / 计数 / 删除按钮文案。所有勾选改动都汇总到这里。 */
+function syncBlankPick() {
+  const n = blankPick.size;
+  $('#blankPickInfo').textContent = `已选 ${n} 页`;
+  const go = $('#btnBlankGo');
+  go.disabled = n === 0;
+  go.textContent = n ? `删除勾选的 ${n} 页` : '删除勾选的页';
+  $$('#blankBody .blank-cell').forEach((c) => {
+    const on = blankPick.has(Number(c.dataset.pos));
+    c.classList.toggle('on', on);
+    const box = c.querySelector('input[type=checkbox]');
+    if (box) box.checked = on;
+  });
+  $('#chkBlankAll').checked = blankShowAll;
+  if (blankScan) {
+    $('#blankNote').textContent = n
+      ? `已勾选 ${n} 页 · 点右侧按钮才会真正删除，删完可「↶ 撤销删除」恢复`
+      : '还没有勾选任何页 —— 不会有页面被删掉';
+  }
+}
+
+/** 「全选命中」：把自动判定命中的页全部勾上（重新扫描后就是这个状态）。 */
+function selectAllHits() {
+  blankPick = new Set(((blankScan && blankScan.pages) || []).map((p) => p.pos));
+  syncBlankPick();
+}
+
+async function runBlankDelete() {
+  const positions = Array.from(blankPick).sort((a, b) => a - b);
+  if (!positions.length) return;
+  const btn = $('#btnBlankGo');
+  btn.disabled = true;
+  try {
+    const snap = await post('/api/out/remove', { positions });
+    apply(snap);
+    closeBlankDialog();
+    toast(`已删除勾选的 ${positions.length} 页，成品剩 ${snap.out_count} 页\n` +
+      '删错了点「↶ 撤销删除」即可恢复', 'ok', 5600);
+  } catch (err) {
+    toast(err.message || String(err), 'err', 5000);
+    btn.disabled = false;
+  }
+}
+
+async function undoRemove() {
+  try {
+    const snap = await request('/api/out/undo', { method: 'POST' });
+    apply(snap);
+    toast(`已撤销删除，恢复 ${snap.restored} 页`, 'ok');
+  } catch (err) {
+    toast(err.message || String(err), 'err', 5000);
+  }
+}
+
+/* 弹窗事件（注册在大图预览的监听器之前，Esc 才能让大图优先关） */
+
+$('#segBlank').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-preset]');
+  if (!btn || btn.dataset.preset === blankPreset) return;
+  blankPreset = btn.dataset.preset;
+  localStorage.setItem('pdf_splice_blank_preset', blankPreset);
+  $$('#segBlank button').forEach((b) => b.classList.toggle('on', b === btn));
+  refreshBlankScan();                 // 指标有缓存，换档位是秒回
+});
+
+/* 「显示全部页」只是换渲染范围，不用重扫：rows 里已经有每一页的指标了 */
+$('#chkBlankAll').addEventListener('change', (e) => {
+  blankShowAll = e.target.checked;
+  if (!blankScan) return;
+  renderBlankGrid();
+  syncBlankPick();
+});
+
+/* 勾选框自己被点（含点 label、键盘空格）：浏览器已翻好状态，这里只同步 */
+$('#blankBody').addEventListener('change', (e) => {
+  const box = e.target.closest('input[type=checkbox]');
+  const cell = box && box.closest('.blank-cell');
+  if (!cell) return;
+  const pos = Number(cell.dataset.pos);
+  if (box.checked) blankPick.add(pos); else blankPick.delete(pos);
+  syncBlankPick();
+});
+
+document.addEventListener('click', (e) => {
+  const hit = e.target.closest('#blankModal [data-blank]');
+  if (hit) {
+    const what = hit.dataset.blank;
+    if (what === 'cancel') return closeBlankDialog();
+    if (what === 'confirm') return runBlankDelete();
+    if (what === 'all') return selectAllHits();
+    if (what === 'none') { blankPick = new Set(); return syncBlankPick(); }
+    return;
+  }
+  if ($('#blankModal').classList.contains('hidden')) return;
+
+  const cell = e.target.closest('.blank-cell');
+  if (cell) {
+    if (e.target.closest('[data-zoom]')) return openLightbox('OUT', Number(cell.dataset.pos));
+    if (e.target.closest('.cell-pick')) return;        // 交给上面的 change 监听
+    const pos = Number(cell.dataset.pos);              // 点卡片 = 勾选 / 取消
+    if (blankPick.has(pos)) blankPick.delete(pos); else blankPick.add(pos);
+    return syncBlankPick();
+  }
+  if (e.target.id === 'blankModal') closeBlankDialog();   // 点遮罩关闭
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  if (!$('#lightbox').classList.contains('hidden')) return;   // 大图开着时 Esc 只关大图
+  if (!$('#blankModal').classList.contains('hidden')) closeBlankDialog();
+});
+
 /* ------------------------------------------------ 事件：点击 */
 
 document.addEventListener('click', async (e) => {
@@ -308,7 +595,22 @@ document.addEventListener('click', async (e) => {
       const delta = Number(actBtn.dataset.delta || 90);
       return guard(post('/api/rotate', { slot, delta, index: null }));
     }
+    if (act === 'reverse') {
+      const doc = app.data.docs[slot];
+      if (!doc || !doc.loaded) return toast(`PDF_${slot} 还没载入 PDF`, 'warn');
+      const wasReversed = !!doc.reversed;
+      return guard(post('/api/reverse_slot', { slot }),
+        wasReversed
+          ? `PDF_${slot} 已恢复原页序`
+          : `PDF_${slot} 已倒序 · 成品内容未改动，想按新顺序请重新点「生成成品」`);
+    }
     if (act === 'add-all') return guard(post('/api/out/insert', { slot, all: true }));
+
+    if (act === 'blank') return openBlankDialog();
+    if (act === 'undo') {
+      if (!app.data.undo || !app.data.undo.available) return;
+      return undoRemove();
+    }
 
     if (act === 'clear') {
       if (!confirm(`确定清空 PDF_${slot} 吗？（成品里来自这一叠的页面也会移除）`)) return;
@@ -335,12 +637,13 @@ document.addEventListener('click', async (e) => {
     return;
   }
 
-  // 4) 点击缩略图 → 放大预览
+  // 4) 点击缩略图 → 放大预览（弹窗里的卡片归弹窗自己的监听器管：点卡片 = 勾选）
   const card = e.target.closest('.page');
   if (card) return openLightbox(card.dataset.slot, Number(card.dataset.index));
 
   const row = e.target.closest('.out-row');
-  if (row) return openLightbox(row.dataset.srcSlot, Number(row.dataset.srcIndex));
+  // 成品页按「成品列表」的坐标预览：翻页要沿着合并后的顺序走，而不是回到来源那一叠
+  if (row) return openLightbox('OUT', Number(row.dataset.pos));
 });
 
 /* ------------------------------------------------ 事件：栏头 / 参数控件 */
@@ -533,10 +836,56 @@ $$('.col').forEach((col) => {
 
 /* ------------------------------------------------ 放大预览 */
 
-function openLightbox(slot, index) {
-  const doc = app.data.docs[slot];
-  if (!doc || !doc.loaded) return;
-  app.zoom = { slot, index };
+/**
+ * 把 app.zoom 解析成「当前正在预览的那一页」。
+ *
+ * 源栏（A / B）：坐标就是该叠里的页码。
+ * 成品栏（OUT）：坐标是成品列表里的位置；缩略图仍取自它来源的那一页。
+ * 遍历一律按「当前所在栏」的总页数走，所以成品栏翻页是 80 页而不是来源的 40 页。
+ *
+ * 返回 { frame, index, total, rot, thumbSlot, thumbIndex, title, alt }，无效时返回 null。
+ */
+function lightboxTarget() {
+  if (!app.zoom || !app.data) return null;
+  const { frame, index } = app.zoom;
+
+  if (frame === 'OUT') {
+    const out = app.data.out || [];
+    if (!(index >= 0 && index < out.length)) return null;
+    const item = out[index];
+    return {
+      frame,
+      index,
+      total: out.length,
+      rot: item.rot,
+      thumbSlot: item.slot,
+      thumbIndex: item.index,
+      title: `PDF_out 第 ${index + 1} / ${out.length} 页 · 来自 PDF_${item.slot} 第 ${item.index + 1} 页`,
+      alt: `out${index + 1}`,
+    };
+  }
+
+  const doc = app.data.docs[frame];
+  if (!doc || !doc.loaded || !(index >= 0 && index < doc.page_count)) return null;
+  return {
+    frame,
+    index,
+    total: doc.page_count,
+    rot: doc.rots[index],
+    thumbSlot: frame,
+    thumbIndex: index,
+    title: `PDF_${frame} 第 ${index + 1} / ${doc.page_count} 页`,
+    alt: `${frame}${index + 1}`,
+  };
+}
+
+function openLightbox(frame, index) {
+  if (!app.data) return;
+  app.zoom = { frame, index };
+  if (!lightboxTarget()) {          // 越界（比如那一栏是空的）就不开
+    app.zoom = null;
+    return;
+  }
   renderLightbox();
   $('#lightbox').classList.remove('hidden');
 }
@@ -548,24 +897,34 @@ function closeLightbox() {
 }
 
 function renderLightbox() {
-  if (!app.zoom || !app.data) return;
-  const { slot, index } = app.zoom;
-  const doc = app.data.docs[slot];
-  if (!doc || !doc.loaded || !(index >= 0 && index < doc.page_count)) return closeLightbox();
-  const rot = doc.rots[index];
-  $('#lbTitle').textContent =
-    `PDF_${slot} 第 ${index + 1} / ${doc.page_count} 页` + (rot ? ` · 已旋转 ${rot}°` : '');
+  const t = lightboxTarget();
+  if (!t) return closeLightbox();
+  const rot = ((t.rot % 360) + 360) % 360;
+  $('#lbTitle').textContent = t.title + (rot ? ` · 已旋转 ${rot}°` : '');
   const img = $('#lbImg');
-  img.src = thumbUrl(slot, index, rot, 1400);
-  img.alt = `${slot}${index + 1}`;
+  img.src = thumbUrl(t.thumbSlot, t.thumbIndex, t.rot, 1400);
+  img.alt = t.alt;
 }
 
 function zoomStep(delta) {
-  if (!app.zoom) return;
-  const doc = app.data.docs[app.zoom.slot];
-  if (!doc || !doc.loaded) return;
-  app.zoom.index = (app.zoom.index + delta + doc.page_count) % doc.page_count;
+  const t = lightboxTarget();
+  if (!t) return;
+  app.zoom.index = (t.index + delta + t.total) % t.total;
   renderLightbox();
+}
+
+/**
+ * 预览里旋转。两者的语义不同，必须分开调：
+ *  源页 → /api/rotate（会连带更新成品里由它生成、且没被单独转过的页）
+ *  成品页 → /api/out/rotate（只转成品里的这一格，不动源页）
+ */
+function rotateZoomed(delta) {
+  const t = lightboxTarget();
+  if (!t) return;
+  const req = t.frame === 'OUT'
+    ? post('/api/out/rotate', { positions: [t.index], delta })
+    : post('/api/rotate', { slot: t.frame, index: t.index, delta });
+  guard(req, null).then(() => renderLightbox());
 }
 
 document.addEventListener('click', (e) => {
@@ -579,9 +938,7 @@ document.addEventListener('click', (e) => {
   if (act === 'prev') return zoomStep(-1);
   if (act === 'next') return zoomStep(1);
   if (!app.zoom) return;
-  const delta = act === 'rot-l' ? -90 : 90;
-  guard(post('/api/rotate', { slot: app.zoom.slot, index: app.zoom.index, delta }), null)
-    .then(() => renderLightbox());
+  rotateZoomed(act === 'rot-l' ? -90 : 90);
 });
 
 document.addEventListener('keydown', (e) => {
@@ -589,10 +946,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') closeLightbox();
   else if (e.key === 'ArrowLeft' || e.key === 'PageUp') zoomStep(-1);
   else if (e.key === 'ArrowRight' || e.key === 'PageDown') zoomStep(1);
-  else if (e.key === 'r' || e.key === 'R') {
-    guard(post('/api/rotate', { slot: app.zoom.slot, index: app.zoom.index, delta: 90 }))
-      .then(() => renderLightbox());
-  }
+  else if (e.key === 'r' || e.key === 'R') rotateZoomed(90);
 });
 
 /* ------------------------------------------------ 主题 */
